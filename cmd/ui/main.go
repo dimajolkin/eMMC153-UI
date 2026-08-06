@@ -1,11 +1,10 @@
-// Command ui — desktop GUI for eMMC153 ISP pad annotation.
+// Command ui — разметка фото плат: сетка JEDEC, поиск ISP-пинов.
 package main
 
 import (
 	"bytes"
 	"fmt"
 	"image"
-	"image/color"
 	_ "image/jpeg"
 	_ "image/png"
 	"path/filepath"
@@ -14,7 +13,6 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
-	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
@@ -40,23 +38,21 @@ type uiState struct {
 	path    string
 	src     *image.RGBA
 	result  *emmcisp.Result
-	preview *canvas.Image
-	pad     *mousePad
+	board   *boardView
 	status  *widget.Label
 	stepLbl *widget.Label
 
-	a1x, a1y   *widget.Entry
-	pitchX     *widget.Entry
-	pitchY     *widget.Entry
-	parseBtn   *widget.Button
-	a1Btn      *widget.Button
-	gridBtn    *widget.Button
+	a1x, a1y *widget.Entry
+	pitchX   *widget.Entry
+	pitchY   *widget.Entry
+	parseBtn *widget.Button
+	a1Btn    *widget.Button
+	gridBtn  *widget.Button
 
 	stage  stage
 	fit    emmcisp.Lattice
 	a1Set  bool
 	gridOK bool
-	showMask bool
 }
 
 func main() {
@@ -65,23 +61,22 @@ func main() {
 	}
 
 	a := app.NewWithID("cytatv.emmc-isp")
-	w := a.NewWindow("eMMC153 ISP Annotate")
+	w := a.NewWindow("eMMC153 — разметка платы")
 	w.Resize(fyne.NewSize(1180, 800))
 
 	st := &uiState{
 		win:     w,
-		status:  widget.NewLabel("⌘V — вставь скрин footprint"),
+		status:  widget.NewLabel("⌘V — фото footprint платы"),
 		stepLbl: widget.NewLabel("Этап 0 · картинка"),
 		stage:   stageNeedImage,
+		board:   newBoardView(),
 	}
 	st.status.Wrapping = fyne.TextWrapWord
 	st.stepLbl.TextStyle = fyne.TextStyle{Bold: true}
 
-	st.preview = canvas.NewImageFromImage(nil)
-	st.pad = newMousePad()
-	st.pad.onGrid = st.onGridPlaced
-	st.pad.onA1 = st.onA1Clicked
-	st.pad.onDragPreview = st.onGridDrag
+	st.board.pad.onGrid = st.onGridPlaced
+	st.board.pad.onA1 = st.onA1Clicked
+	st.board.pad.onDragPreview = st.onGridDrag
 
 	st.a1x = numEntry("")
 	st.a1y = numEntry("")
@@ -97,14 +92,13 @@ func main() {
 
 	st.gridBtn = widget.NewButton("1. Сетка мышкой", st.beginGrid)
 	st.a1Btn = widget.NewButton("2. Ключ A1", st.beginA1)
-	st.parseBtn = widget.NewButtonWithIcon("3. Разобрать пины", theme.ConfirmIcon(), st.parsePins)
+	st.parseBtn = widget.NewButtonWithIcon("3. Найти пины", theme.ConfirmIcon(), st.parsePins)
 	st.parseBtn.Importance = widget.HighImportance
 	st.parseBtn.Disable()
 	st.a1Btn.Disable()
 	st.gridBtn.Disable()
 
 	saveBtn := widget.NewButtonWithIcon("Сохранить…", theme.DocumentSaveIcon(), st.save)
-	maskBtn := widget.NewButton("Маска B&W", st.toggleMask)
 
 	form := container.New(layout.NewFormLayout(),
 		widget.NewLabel("A1 X"), st.a1x,
@@ -114,8 +108,8 @@ func main() {
 	)
 
 	side := container.NewVBox(
-		widget.NewLabelWithStyle("eMMC153 ISP", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		widget.NewLabel("JEDEC 14×14"),
+		widget.NewLabelWithStyle("Разметка платы", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewLabel("eMMC153 · JEDEC 14×14"),
 		st.stepLbl,
 		widget.NewSeparator(),
 		pasteBtn,
@@ -126,14 +120,13 @@ func main() {
 		widget.NewLabel("Подгонка:"),
 		form,
 		st.parseBtn,
-		maskBtn,
 		saveBtn,
 		widget.NewSeparator(),
 		st.status,
 	)
 
 	root := container.NewBorder(nil, nil, container.NewPadded(side), nil,
-		container.NewPadded(wrapPreview(st.preview, st.pad)))
+		container.NewPadded(st.board))
 	w.SetContent(root)
 	w.Canvas().AddShortcut(&fyne.ShortcutPaste{}, func(fyne.Shortcut) {
 		st.pasteClipboard()
@@ -148,18 +141,21 @@ func numEntry(v string) *widget.Entry {
 }
 
 func (st *uiState) setStatus(s string) { st.status.SetText(s) }
+func (st *uiState) setStep(s string)   { st.stepLbl.SetText(s) }
 
-func (st *uiState) setStep(s string) { st.stepLbl.SetText(s) }
+func (st *uiState) refreshOverlay() {
+	showGrid := st.gridOK || st.fit.PX > 0
+	showISP := st.stage == stageDone && st.result != nil
+	st.board.setLattice(st.fit, showGrid, st.a1Set, showISP)
+}
 
 func (st *uiState) setSource(img image.Image, label string) {
 	st.src = emmcisp.ToRGBA(img)
 	st.path = label
 	st.result = nil
-	st.showMask = false
 	st.fit = emmcisp.Lattice{}
 	st.a1Set = false
 	st.gridOK = false
-	st.pad.setImageSize(st.src.Bounds().Dx(), st.src.Bounds().Dy())
 	st.a1x.SetText("")
 	st.a1y.SetText("")
 	st.pitchX.SetText("")
@@ -167,11 +163,12 @@ func (st *uiState) setSource(img image.Image, label string) {
 	st.parseBtn.Disable()
 	st.a1Btn.Disable()
 	st.gridBtn.Enable()
-	st.showImage(st.src)
+	st.board.setPhoto(st.src)
+	st.board.setLattice(emmcisp.Lattice{}, false, false, false)
 	st.stage = stagePlaceGrid
 	st.setStep("Этап 1 · сетка")
-	st.pad.mode = "grid"
-	st.setStatus(fmt.Sprintf("%s (%dx%d). Растяни сетку от центра A1 до противоположного угла (P14)",
+	st.board.pad.mode = "grid"
+	st.setStatus(fmt.Sprintf("%s (%dx%d). Растяни сетку: A1 → противоположный угол",
 		label, st.src.Bounds().Dx(), st.src.Bounds().Dy()))
 }
 
@@ -214,11 +211,11 @@ func (st *uiState) beginGrid() {
 		return
 	}
 	st.stage = stagePlaceGrid
-	st.pad.mode = "grid"
+	st.board.pad.mode = "grid"
 	st.result = nil
 	st.setStep("Этап 1 · сетка")
-	st.setStatus("Тяни мышью: от центра шара A1 к центру противоположного угла (ряд P / кол. 14)")
-	st.refreshPreview()
+	st.setStatus("Тяни мышью от центра A1 к противоположному углу (P14)")
+	st.refreshOverlay()
 }
 
 func (st *uiState) beginA1() {
@@ -227,30 +224,32 @@ func (st *uiState) beginA1() {
 		return
 	}
 	st.stage = stageMarkA1
-	st.pad.mode = "a1"
+	st.board.pad.mode = "a1"
 	st.result = nil
 	st.setStep("Этап 2 · ключ A1")
-	st.setStatus("Кликни ключ A1: вырез на шёлке / первый пад (верхний левый)")
-	st.refreshPreview()
+	st.setStatus("Кликни ключ A1 (вырез шёлка / первый пад)")
+	st.refreshOverlay()
 }
 
 func (st *uiState) onGridDrag(ox, oy, px, py float64) {
 	st.fit = emmcisp.Lattice{OX: ox, OY: oy, PX: px, PY: py}
-	st.refreshPreview()
+	st.gridOK = true
+	st.a1Set = true
+	st.board.setLatticeLive(st.fit)
 }
 
 func (st *uiState) onGridPlaced(ox, oy, px, py float64) {
 	st.fit = emmcisp.Lattice{OX: ox, OY: oy, PX: px, PY: py}
 	st.gridOK = true
-	st.a1Set = true // drag start is provisional A1
+	st.a1Set = true
 	st.syncFields()
 	st.a1Btn.Enable()
 	st.parseBtn.Enable()
 	st.stage = stageMarkA1
-	st.pad.mode = "a1"
+	st.board.pad.mode = "a1"
 	st.setStep("Этап 2 · ключ A1")
-	st.setStatus(fmt.Sprintf("Сетка: pitch=%.2f×%.2f. Кликни ключ A1 (вырез шёлка), потом подгони числа справа", px, py))
-	st.refreshPreview()
+	st.setStatus(fmt.Sprintf("Сетка pitch=%.2f×%.2f — кликни ключ A1", px, py))
+	st.refreshOverlay()
 }
 
 func (st *uiState) onA1Clicked(x, y float64) {
@@ -258,10 +257,10 @@ func (st *uiState) onA1Clicked(x, y float64) {
 	st.a1Set = true
 	st.syncFields()
 	st.stage = stageTune
-	st.pad.mode = ""
+	st.board.pad.mode = ""
 	st.setStep("Этап 3 · подгонка")
-	st.setStatus(fmt.Sprintf("A1=(%.1f,%.1f). Подгони Pitch X/Y в полях, затем «Разобрать пины»", x, y))
-	st.refreshPreview()
+	st.setStatus(fmt.Sprintf("A1=(%.1f,%.1f) — подгони pitch, затем «Найти пины»", x, y))
+	st.refreshOverlay()
 }
 
 func (st *uiState) syncFields() {
@@ -288,22 +287,7 @@ func (st *uiState) applyTuneFromFields() {
 		st.stage = stageTune
 		st.result = nil
 	}
-	st.refreshPreview()
-}
-
-func (st *uiState) refreshPreview() {
-	if st.src == nil {
-		return
-	}
-	if st.result != nil && st.stage == stageDone {
-		st.showImage(st.result.Annotated)
-		return
-	}
-	if st.gridOK || st.fit.PX > 0 {
-		st.showImage(emmcisp.DrawGridPreview(st.src, st.fit, st.a1Set))
-		return
-	}
-	st.showImage(st.src)
+	st.refreshOverlay()
 }
 
 func (st *uiState) parsePins() {
@@ -312,7 +296,7 @@ func (st *uiState) parsePins() {
 		return
 	}
 	st.applyTuneFromFields()
-	st.setStatus("Разбираю пины по сетке…")
+	st.setStatus("Ищу пины по сетке…")
 	res, err := emmcisp.AnnotateLattice(st.src, st.fit)
 	if err != nil {
 		dialog.ShowError(err, st.win)
@@ -322,30 +306,16 @@ func (st *uiState) parsePins() {
 	st.result = res
 	st.fit = res.Lattice
 	st.stage = stageDone
-	st.pad.mode = ""
+	st.board.pad.mode = ""
 	st.setStep("Готово")
-	st.showImage(res.Annotated)
-	st.setStatus(fmt.Sprintf("ISP: A1=(%.1f,%.1f) pitch=%.2f×%.2f  cells=%d pads=%d",
-		res.Lattice.OX, res.Lattice.OY, res.Lattice.PX, res.Lattice.PY, res.Lattice.Cells, len(res.Pads)))
-}
-
-func (st *uiState) toggleMask() {
-	if st.result == nil {
-		st.setStatus("Сначала разбери пины")
-		return
-	}
-	st.showMask = !st.showMask
-	if st.showMask {
-		st.showImage(grayToRGBA(st.result.Mask))
-		st.setStatus("Маска B&W")
-	} else {
-		st.showImage(st.result.Annotated)
-	}
+	st.refreshOverlay()
+	st.setStatus(fmt.Sprintf("Найдено: cells=%d pads=%d  A1=(%.1f,%.1f) pitch=%.2f×%.2f",
+		res.Lattice.Cells, len(res.Pads), res.Lattice.OX, res.Lattice.OY, res.Lattice.PX, res.Lattice.PY))
 }
 
 func (st *uiState) save() {
 	if st.result == nil {
-		st.setStatus("Сначала разбери пины")
+		st.setStatus("Сначала найди пины")
 		return
 	}
 	dialog.ShowFileSave(func(w fyne.URIWriteCloser, err error) {
@@ -368,27 +338,4 @@ func (st *uiState) save() {
 		}
 		st.setStatus(fmt.Sprintf("Сохранено: %s", filepath.Base(path)))
 	}, st.win)
-}
-
-func (st *uiState) showImage(img image.Image) {
-	if img == nil {
-		return
-	}
-	st.preview.Image = img
-	st.preview.Refresh()
-}
-
-func grayToRGBA(g *image.Gray) *image.RGBA {
-	if g == nil {
-		return image.NewRGBA(image.Rect(0, 0, 1, 1))
-	}
-	b := g.Bounds()
-	out := image.NewRGBA(b)
-	for y := b.Min.Y; y < b.Max.Y; y++ {
-		for x := b.Min.X; x < b.Max.X; x++ {
-			v := g.GrayAt(x, y).Y
-			out.SetRGBA(x, y, color.RGBA{R: v, G: v, B: v, A: 255})
-		}
-	}
-	return out
 }

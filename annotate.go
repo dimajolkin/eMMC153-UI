@@ -19,16 +19,14 @@ import (
 	"golang.org/x/image/math/fixed"
 )
 
-var rows = []byte("ABCDEFGHJKLMNP") // 14 JEDEC rows, skip I/O
-
-type ispPin struct {
+type ISPPin struct {
 	Name  string
 	Row   byte
 	Col   int
 	Color color.RGBA
 }
 
-var ispPins = []ispPin{
+var ISPPins = []ISPPin{
 	{"DAT0", 'A', 3, color.RGBA{R: 255, G: 220, B: 0, A: 255}},
 	{"GND", 'A', 6, color.RGBA{R: 255, G: 255, B: 255, A: 255}},
 	{"VCC", 'E', 6, color.RGBA{R: 50, G: 160, B: 255, A: 255}},
@@ -36,6 +34,12 @@ var ispPins = []ispPin{
 	{"CMD", 'M', 5, color.RGBA{R: 255, G: 165, B: 0, A: 255}},
 	{"CLK", 'M', 6, color.RGBA{R: 255, G: 40, B: 40, A: 255}},
 }
+
+// RowsJEDEC is A..P skipping I/O (14 rows).
+var RowsJEDEC = []byte("ABCDEFGHJKLMNP")
+
+var ispPins = ISPPins
+var rows = RowsJEDEC
 
 type Pt struct{ X, Y float64 }
 
@@ -1197,6 +1201,11 @@ func rowIndex(row byte) int {
 
 func ballXY(fit Lattice, row byte, col int) Pt {
 	return Pt{X: fit.OX + float64(col-1)*fit.PX, Y: fit.OY + float64(rowIndex(row))*fit.PY}
+}
+
+// BallXY returns image coordinates for JEDEC ball (row letter, col 1..14).
+func BallXY(fit Lattice, row byte, col int) Pt {
+	return ballXY(fit, row, col)
 }
 
 func DrawAnnotation(src *image.RGBA, fit Lattice, pads []Pt, roi image.Rectangle) *image.RGBA {
